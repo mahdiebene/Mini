@@ -289,6 +289,9 @@
     .field small { color: var(--faint); line-height: 1.38; }
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .inline { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .status-line { color: var(--faint); font-size: .78rem; line-height: 1.38; flex: 1 1 180px; }
+    .status-line.ok { color: var(--ok); }
+    .status-line.bad { color: #ffd3ca; }
     .switch-row { margin-bottom: 12px; border: 1px solid var(--line); border-radius: 18px; padding: 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
     .switch-row span { color: var(--muted); font-size: .86rem; }
     .switch { position: relative; width: 48px; height: 28px; flex: 0 0 auto; }
@@ -458,6 +461,10 @@
         <input id="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="pk_… recommended for mobile web" />
         <small>Use a Pollinations publishable key (<b>pk_</b>) for browser BYOK. Do not hard-code an <b>sk_</b> secret inside this file.</small>
       </div>
+      <div class="inline" style="margin:-4px 0 14px">
+        <button class="soft-btn" id="testApiBtn" type="button">Test API</button>
+        <span class="status-line" id="apiTestStatus">Sends one tiny non-stream request. Your key is not written into this file.</span>
+      </div>
       <div class="switch-row">
         <span>Remember key on this device</span>
         <label class="switch"><input id="rememberKey" type="checkbox" /><span class="slider"></span></label>
@@ -548,7 +555,7 @@
         input: $('messageInput'), composer: $('composer'), sendBtn: $('sendBtn'), contextHint: $('contextHint'),
         botSheet: $('botSheet'), botSheetTitle: $('botSheetTitle'), botName: $('botName'), botSubtitle: $('botSubtitle'), botIcon: $('botIcon'), botInstructions: $('botInstructions'),
         settingsSheet: $('settingsSheet'), apiKey: $('apiKey'), rememberKey: $('rememberKey'), modelId: $('modelId'), temperature: $('temperature'), temperatureValue: $('temperatureValue'), maxTokens: $('maxTokens'), contextChars: $('contextChars'), streaming: $('streaming'), reasoningOff: $('reasoningOff'),
-        toast: $('toast'), importFile: $('importFile')
+        testApiBtn: $('testApiBtn'), apiTestStatus: $('apiTestStatus'), toast: $('toast'), importFile: $('importFile')
       };
 
       const uid = () => crypto?.randomUUID?.() || (Date.now().toString(36) + Math.random().toString(36).slice(2));
@@ -698,6 +705,7 @@
         $('duplicateBotBtn').addEventListener('click', duplicateActiveBot);
         $('deleteBotBtn').addEventListener('click', deleteActiveBot);
         $('saveSettingsBtn').addEventListener('click', persistSettings);
+        $('testApiBtn').addEventListener('click', testApiConnection);
         $('importBtn').addEventListener('click', () => els.importFile.click());
         $('importFile').addEventListener('change', importData);
         $('wipeBtn').addEventListener('click', wipeAll);
@@ -959,11 +967,11 @@
       async function requestAssistant() {
         const bot = activeBot();
         if (!bot) return;
+        const payload = buildPayload(bot);
         const assistant = await addMessage('assistant', '');
         renderMessages(true);
         const bubble = lastAssistantBubble();
         if (bubble) bubble.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
-        const payload = buildPayload(bot);
         state.abortController = new AbortController();
         const timeout = setTimeout(() => state.abortController?.abort(), 180000);
         setSending(true);
@@ -991,19 +999,41 @@
       }
 
       function buildPayload(bot) {
-        const payload = {
-          model: state.settings.modelId || 'grok',
+        return {
+          model: (state.settings.modelId || 'grok').trim() || 'grok',
           messages: prepareContext(bot),
           temperature: Number(state.settings.temperature ?? 0.8),
-          max_tokens: Number(state.settings.maxTokens || 2200),
-          stream: !!state.settings.streaming
+          max_tokens: Number(state.settings.maxTokens || 2200)
         };
-        if (state.settings.reasoningOff !== false) {
-          payload.reasoning_effort = 'none';
-          payload.thinking = { type: 'disabled', budget_tokens: 0 };
-          payload.thinking_budget = 0;
+      }
+
+      function sanitizeMessages(messages) {
+        const clean = [];
+        for (const m of messages || []) {
+          const role = String(m.role || '').trim();
+          const content = String(m.content || '').trim();
+          if (!['system', 'user', 'assistant', 'tool'].includes(role)) continue;
+          if (!content) continue;
+          clean.push({ role, content });
         }
-        return payload;
+        if (!clean.some((m) => m.role === 'user')) clean.push({ role: 'user', content: 'Hello.' });
+        return clean;
+      }
+
+      function apiBody(payload, { stream = false, minimal = false } = {}) {
+        const body = {
+          model: String(payload.model || 'grok').trim() || 'grok',
+          messages: sanitizeMessages(payload.messages),
+          stream: !!stream
+        };
+        if (!minimal) {
+          const maxTokens = Number(payload.max_tokens || state.settings.maxTokens || 2200);
+          const temp = Number(payload.temperature ?? state.settings.temperature ?? 0.8);
+          if (Number.isFinite(maxTokens)) body.max_tokens = Math.max(1, Math.floor(maxTokens));
+          if (Number.isFinite(temp)) body.temperature = temp;
+          if (state.settings.reasoningOff !== false) body.reasoning_effort = 'none';
+        }
+        return body;
       }
 
       function prepareContext(bot) {
@@ -1016,10 +1046,13 @@
         if (bot.memory) systemParts.push('Compact memory from older local turns:\n' + bot.memory);
         const selected = [];
         let used = systemParts.join('\n\n').length;
-        const cleanMessages = state.messages.filter((m) => !m.error && (m.role === 'user' || m.role === 'assistant'));
+        const cleanMessages = state.messages.filter((m) => {
+          if (m.error || !['user', 'assistant'].includes(m.role)) return false;
+          return String(m.content || '').trim().length > 0;
+        });
         for (let i = cleanMessages.length - 1; i >= 0; i--) {
           const m = cleanMessages[i];
-          const content = String(m.content || '').slice(0, 12000);
+          const content = String(m.content || '').trim().slice(0, 12000);
           const cost = content.length + 24;
           if (selected.length >= 10 && used + cost > maxChars) break;
           selected.unshift({ role: m.role, content });
@@ -1029,16 +1062,32 @@
         return [{ role: 'system', content: systemParts.join('\n\n') }, ...selected];
       }
 
-      async function callJson(payload) {
-        const res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ ...payload, stream: false }), signal: state.abortController.signal });
-        if (!res.ok) throw await responseError(res);
+      async function callJson(payload, { minimal = false } = {}) {
+        const body = apiBody(payload, { stream: false, minimal });
+        const res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body), signal: state.abortController?.signal });
+        if (!res.ok) {
+          const err = await responseError(res);
+          if (!minimal && /400|validation/i.test(err.message)) return callJson(payload, { minimal: true });
+          throw err;
+        }
         const data = await res.json();
         return extractContent(data);
       }
 
       async function callStreaming(payload, assistant) {
-        const res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ ...payload, stream: true, stream_options: { include_usage: false } }), signal: state.abortController.signal });
-        if (!res.ok) throw await responseError(res);
+        const body = apiBody(payload, { stream: true, minimal: false });
+        const res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body), signal: state.abortController.signal });
+        if (!res.ok) {
+          const err = await responseError(res);
+          if (/400|validation|stream/i.test(err.message)) {
+            const text = await callJson(payload, { minimal: true });
+            if (assistant) assistant.content = text;
+            const bubble = lastAssistantBubble();
+            if (bubble) bubble.innerHTML = `${formatMessage(text)}<span class="time">${formatTime(assistant.createdAt)}</span>`;
+            return text;
+          }
+          throw err;
+        }
         if (!res.body) return extractContent(await res.json());
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -1077,6 +1126,45 @@
 
       function apiHeaders() {
         return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.settings.apiKey}` };
+      }
+
+      async function testApiConnection() {
+        const previous = { ...state.settings };
+        state.settings = {
+          ...state.settings,
+          apiKey: els.apiKey.value.trim(),
+          modelId: els.modelId.value.trim() || 'grok',
+          temperature: 0,
+          maxTokens: 20,
+          reasoningOff: els.reasoningOff.checked
+        };
+        els.apiTestStatus.className = 'status-line';
+        if (!state.settings.apiKey) {
+          els.apiTestStatus.textContent = 'Paste a Pollinations key first.';
+          els.apiTestStatus.classList.add('bad');
+          state.settings = previous;
+          return;
+        }
+        els.testApiBtn.disabled = true;
+        els.apiTestStatus.textContent = 'Testing with a tiny non-stream request…';
+        try {
+          const testPayload = {
+            model: state.settings.modelId,
+            messages: [{ role: 'user', content: 'Reply with exactly OK.' }],
+            temperature: 0,
+            max_tokens: 20
+          };
+          const text = await callJson(testPayload);
+          els.apiTestStatus.textContent = `Connected. Reply: ${String(text || '').slice(0, 60) || 'OK'}`;
+          els.apiTestStatus.classList.add('ok');
+          toast('Pollinations API connected.');
+        } catch (err) {
+          els.apiTestStatus.textContent = friendlyError(err);
+          els.apiTestStatus.classList.add('bad');
+        } finally {
+          els.testApiBtn.disabled = false;
+          state.settings = { ...previous, apiKey: els.apiKey.value.trim(), modelId: els.modelId.value.trim() || previous.modelId };
+        }
       }
 
       async function responseError(res) {
