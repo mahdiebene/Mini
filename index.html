@@ -463,7 +463,7 @@
       </div>
       <div class="inline" style="margin:-4px 0 14px">
         <button class="soft-btn" id="testApiBtn" type="button">Test API</button>
-        <span class="status-line" id="apiTestStatus">Sends one tiny non-stream request. Your key is not written into this file.</span>
+        <span class="status-line" id="apiTestStatus">Tests the same safe request path used by chat. Your key is not written into this file.</span>
       </div>
       <div class="switch-row">
         <span>Remember key on this device</span>
@@ -472,7 +472,7 @@
       <div class="field">
         <label for="modelId">Model ID</label>
         <input id="modelId" spellcheck="false" value="grok" />
-        <small>Default is <b>grok</b>. You can type another Pollinations model ID if your key supports it.</small>
+        <small>Default is <b>grok</b>, the non-reasoning Grok route currently listed by Pollinations. Type another model ID only if your key supports it.</small>
       </div>
       <div class="split">
         <div class="field">
@@ -491,10 +491,10 @@
       </div>
       <div class="switch-row">
         <span>Stream responses</span>
-        <label class="switch"><input id="streaming" type="checkbox" checked /><span class="slider"></span></label>
+        <label class="switch"><input id="streaming" type="checkbox" /><span class="slider"></span></label>
       </div>
       <div class="switch-row">
-        <span>Force reasoning off</span>
+        <span>Strict Pollinations-safe body</span>
         <label class="switch"><input id="reasoningOff" type="checkbox" checked /><span class="slider"></span></label>
       </div>
       <div class="inline">
@@ -516,6 +516,7 @@
       'use strict';
 
       const ENDPOINT = 'https://gen.pollinations.ai/v1/chat/completions';
+      const TEXT_ENDPOINT = 'https://gen.pollinations.ai/text';
       const DB_NAME = 'aurora-persona-chat-v1';
       const DB_VERSION = 1;
       const STORE_BOTS = 'bots';
@@ -530,7 +531,7 @@
         temperature: 0.8,
         maxTokens: 2200,
         contextChars: 60000,
-        streaming: true,
+        streaming: false,
         reasoningOff: true
       };
 
@@ -749,7 +750,7 @@
         els.activeDesc.textContent = bot.subtitle || 'Custom bot';
         els.keyBadge.textContent = state.settings.apiKey ? (state.settings.rememberKey ? 'Key saved' : 'Key in session') : 'No key';
         els.keyBadge.className = `badge${state.settings.apiKey ? ' ok' : ''}`;
-        els.modelBadge.textContent = `${state.settings.modelId || 'grok'}${state.settings.reasoningOff !== false ? ' · reasoning off' : ''}`;
+        els.modelBadge.textContent = `${state.settings.modelId || 'grok'} · safe body`;
       }
 
       function iconFor(bot) {
@@ -931,6 +932,7 @@
         await put(STORE_MESSAGES, msg);
         const bot = activeBot();
         if (bot) { bot.updatedAt = now(); await put(STORE_BOTS, bot); }
+        if (/500|Internal Server Error|Something went wrong/i.test(msg)) return msg + ' This is a Pollinations model/provider failure; the app already retried with the /text fallback.';
         return msg;
       }
 
@@ -1020,18 +1022,19 @@
         return clean;
       }
 
-      function apiBody(payload, { stream = false, minimal = false } = {}) {
+      function apiBody(payload, { stream = false, advanced = false } = {}) {
         const body = {
           model: String(payload.model || 'grok').trim() || 'grok',
-          messages: sanitizeMessages(payload.messages),
-          stream: !!stream
+          messages: sanitizeMessages(payload.messages)
         };
-        if (!minimal) {
+        // Pollinations is OpenAI-compatible, but some model routes reject extra fields.
+        // The reliable body is exactly model + messages. Stream is only added when requested.
+        if (stream) body.stream = true;
+        if (advanced) {
           const maxTokens = Number(payload.max_tokens || state.settings.maxTokens || 2200);
           const temp = Number(payload.temperature ?? state.settings.temperature ?? 0.8);
           if (Number.isFinite(maxTokens)) body.max_tokens = Math.max(1, Math.floor(maxTokens));
-          if (Number.isFinite(temp)) body.temperature = temp;
-          if (state.settings.reasoningOff !== false) body.reasoning_effort = 'none';
+          if (Number.isFinite(temp)) body.temperature = Math.max(0, Math.min(2, temp));
         }
         return body;
       }
@@ -1062,32 +1065,74 @@
         return [{ role: 'system', content: systemParts.join('\n\n') }, ...selected];
       }
 
-      async function callJson(payload, { minimal = false } = {}) {
-        const body = apiBody(payload, { stream: false, minimal });
-        const res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body), signal: state.abortController?.signal });
-        if (!res.ok) {
-          const err = await responseError(res);
-          if (!minimal && /400|validation/i.test(err.message)) return callJson(payload, { minimal: true });
-          throw err;
+      async function postJson(url, body, signal) {
+        const res = await fetch(url, { method: 'POST', headers: apiHeaders('application/json'), body: JSON.stringify(body), signal });
+        if (!res.ok) throw await responseError(res, url);
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch { return { choices: [{ message: { content: text } }] }; }
+      }
+
+      async function postText(url, body, signal) {
+        const res = await fetch(url, { method: 'POST', headers: apiHeaders('text/plain, application/json'), body: JSON.stringify(body), signal });
+        if (!res.ok) throw await responseError(res, url);
+        const text = await res.text();
+        try {
+          const parsed = JSON.parse(text);
+          return extractContent(parsed) || parsed.text || parsed.content || text;
+        } catch {
+          return text;
         }
-        const data = await res.json();
-        return extractContent(data);
+      }
+
+      async function callJson(payload) {
+        const signal = state.abortController?.signal;
+        const safeBody = apiBody(payload, { stream: false, advanced: false });
+        const errors = [];
+
+        try {
+          const data = await postJson(ENDPOINT, safeBody, signal);
+          const content = extractContent(data);
+          if (String(content || '').trim()) return content;
+          throw new Error('Pollinations /v1/chat/completions returned no assistant text.');
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+          errors.push(err);
+        }
+
+        // Fallback to Pollinations' /text endpoint, which accepts the same OpenAI-style messages
+        // but returns assistant text directly. This protects the app when the chat wrapper returns 500.
+        try {
+          return await postText(TEXT_ENDPOINT, safeBody, signal);
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+          errors.push(err);
+        }
+
+        // Last attempt with optional temperature/token fields. Some keys/models accept this, some don't.
+        try {
+          const data = await postJson(ENDPOINT, apiBody(payload, { stream: false, advanced: true }), signal);
+          const content = extractContent(data);
+          if (String(content || '').trim()) return content;
+          throw new Error('Pollinations /v1/chat/completions returned no assistant text.');
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+          errors.push(err);
+        }
+
+        throw combinedError(errors);
       }
 
       async function callStreaming(payload, assistant) {
-        const body = apiBody(payload, { stream: true, minimal: false });
-        const res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders(), body: JSON.stringify(body), signal: state.abortController.signal });
-        if (!res.ok) {
-          const err = await responseError(res);
-          if (/400|validation|stream/i.test(err.message)) {
-            const text = await callJson(payload, { minimal: true });
-            if (assistant) assistant.content = text;
-            const bubble = lastAssistantBubble();
-            if (bubble) bubble.innerHTML = `${formatMessage(text)}<span class="time">${formatTime(assistant.createdAt)}</span>`;
-            return text;
-          }
-          throw err;
+        const body = apiBody(payload, { stream: true, advanced: false });
+        let res;
+        try {
+          res = await fetch(ENDPOINT, { method: 'POST', headers: apiHeaders('text/event-stream, application/json'), body: JSON.stringify(body), signal: state.abortController.signal });
+        } catch (err) {
+          if (err?.name === 'AbortError') throw err;
+          return finishStreamingFallback(payload, assistant);
         }
+        if (!res.ok) return finishStreamingFallback(payload, assistant);
         if (!res.body) return extractContent(await res.json());
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -1121,11 +1166,23 @@
             } catch { /* ignore keepalive */ }
           }
         }
-        return full;
+        return full || await finishStreamingFallback(payload, assistant);
       }
 
-      function apiHeaders() {
-        return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.settings.apiKey}` };
+      async function finishStreamingFallback(payload, assistant) {
+        const text = await callJson(payload);
+        if (assistant) assistant.content = text;
+        const bubble = lastAssistantBubble();
+        if (bubble) bubble.innerHTML = `${formatMessage(text)}<span class="time">${formatTime(assistant.createdAt)}</span>`;
+        return text;
+      }
+
+      function apiHeaders(accept = 'application/json') {
+        return {
+          'Accept': accept,
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${state.settings.apiKey}`
+        };
       }
 
       async function testApiConnection() {
@@ -1146,7 +1203,7 @@
           return;
         }
         els.testApiBtn.disabled = true;
-        els.apiTestStatus.textContent = 'Testing with a tiny non-stream request…';
+        els.apiTestStatus.textContent = 'Testing safe chat request, then /text fallback if needed…';
         try {
           const testPayload = {
             model: state.settings.modelId,
@@ -1167,14 +1224,30 @@
         }
       }
 
-      async function responseError(res) {
+      async function responseError(res, url = ENDPOINT) {
         let detail = res.statusText || '';
         try {
           const text = await res.text();
-          try { detail = JSON.parse(text)?.error?.message || text; }
-          catch { detail = text || detail; }
+          try {
+            const parsed = JSON.parse(text);
+            detail = parsed?.error?.message || parsed?.message || parsed?.detail || text || detail;
+          } catch { detail = text || detail; }
         } catch { /* ignore */ }
-        return new Error(`Pollinations request failed (${res.status}). ${detail}`.trim());
+        const endpointName = url === TEXT_ENDPOINT ? '/text' : '/v1/chat/completions';
+        const err = new Error(`Pollinations ${endpointName} failed (${res.status}). ${detail}`.trim());
+        err.status = res.status;
+        return err;
+      }
+
+      function combinedError(errors) {
+        const last = errors.filter(Boolean).at(-1);
+        const first = errors.filter(Boolean)[0];
+        const msg = [first, last]
+          .filter(Boolean)
+          .map((e) => String(e.message || e))
+          .filter((v, i, a) => a.indexOf(v) === i)
+          .join(' | ');
+        return new Error(`Pollinations failed after safe chat + /text fallback. ${msg}`.trim());
       }
 
       function extractContent(data) {
@@ -1189,9 +1262,10 @@
       function friendlyError(err) {
         const msg = String(err?.message || err);
         if (/401|403|unauthorized|forbidden/i.test(msg)) return 'API key rejected. Check your Pollinations key and whether it can use this model.';
-        if (/404|model/i.test(msg)) return 'Model not available for this key. Try “grok” or check your Pollinations model permissions.';
+        if (/404|model/i.test(msg)) return 'Model not available for this key. Keep Model ID as “grok”, or check your Pollinations model permissions.';
         if (/429|rate/i.test(msg)) return 'Rate limit hit. Wait a bit, or use a Pollinations key with more capacity.';
         if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) return 'Network or CORS problem. Check your connection and whether Pollinations is reachable from this browser.';
+        if (/500|Internal Server Error|Something went wrong/i.test(msg)) return msg + ' The app retried using the Pollinations /text fallback too.';
         return msg;
       }
 
